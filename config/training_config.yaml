@@ -1,0 +1,120 @@
+# Training Configuration
+
+# General Training Parameters
+training:
+  device: "cuda"  # cuda, cpu, or mps
+  mixed_precision: true
+  precision: "fp16"  # fp16, bf16, or fp32
+  
+  # Optimizer
+  optimizer:
+    type: "adamw"
+    learning_rate: 2.0e-5
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+    weight_decay: 5.0e-4
+    
+  # Learning rate scheduler
+  scheduler:
+    type: "cosine"
+    warmup_ratio: 0.1
+    num_cycles: 0.5
+    min_lr: 1.0e-7
+    
+  # Gradient clipping
+  gradient_clipping:
+    enabled: true
+    max_norm: 1.0
+    
+  # Early stopping
+  early_stopping:
+    enabled: true
+    patience: 50
+    min_delta: 1.0e-4
+    monitor: "val_loss"
+
+# Data Splitting
+data_split:
+  pretraining_ratio: 0.75
+  fine_tuning_ratio: 0.20
+  test_ratio: 0.05
+  
+  # Ensure no overlap
+  enforce_mutual_exclusivity: true
+  random_seed: 42
+
+# Pretraining Configuration
+pretraining:
+  objective: "coarse_classification"  # benign vs malicious
+  
+  # Data preprocessing
+  preprocessing:
+    remove_incomplete_flows: true
+    min_packets_per_flow: 2
+    min_payload_bytes: 1
+    idle_timeout_seconds: 60
+    
+  # Training parameters
+  batch_size: 64
+  max_epochs: 100
+  checkpoint_every_n_epochs: 10
+  
+  # Loss function
+  loss:
+    type: "cross_entropy"
+    label_smoothing: 0.1
+
+# Fine-tuning Configuration
+fine_tuning:
+  objective: "fine_grained_classification"
+  
+  # Alignment depth checkpoints
+  alignment_checkpoints:
+    - 0.25  # 25% of alignment trajectory (θ₁⁽¹⁾)
+    - 0.50  # 50% of alignment trajectory (θ₁⁽²⁾)
+    - 0.75  # 75% of alignment trajectory (θ₁⁽³⁾)
+    - 1.00  # 100% of alignment trajectory (θ₁⁽⁴⁾)
+    
+  # Training parameters
+  batch_size: 32
+  max_epochs: 50
+  checkpoint_every_n_epochs: 5
+  
+  # Loss function
+  loss:
+    type: "cross_entropy"
+    label_smoothing: 0.05
+
+# Perturbation Training Configuration
+perturbation_training:
+  # Continue training with perturbation set U
+  learning_rate: 1.0e-5
+  batch_size: 16
+  max_epochs: 20
+  
+  # Loss configuration
+  loss:
+    # Encourage reversion to pretrained distribution
+    kl_divergence_weight: 0.3
+    classification_weight: 0.7
+
+# Logging and Checkpointing
+logging:
+  log_every_n_steps: 100
+  tensorboard_dir: "./runs"
+  save_dir: "./checkpoints"
+  
+  # What to log
+  metrics:
+    - "train_loss"
+    - "val_loss"
+    - "train_accuracy"
+    - "val_accuracy"
+    - "kl_divergence"
+    - "learning_rate"
+    
+# Reproducibility
+reproducibility:
+  seed: 42
+  deterministic: true
+  benchmark: false
