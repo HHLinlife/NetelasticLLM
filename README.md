@@ -13,33 +13,6 @@ This project implements an **elasticity-guided framework** for discovering minim
 3. **Dual-Layer Evolution**: Submodular coverage + constrained GA for efficient perturbation discovery
 4. **Protocol-Compliant Perturbations**: Genome encoding for realistic packet-level manipulations
 
-## Architecture
-
-The system consists of the following components:
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                   Pretrained Traffic LLM (M₀)               │
-│                 (Coarse: Benign vs Malicious)               │
-└─────────────────────────────────────────────────────────────┘
-                            ↓ Fine-tuning
-┌─────────────────────────────────────────────────────────────┐
-│                  Fine-tuned Traffic LLM (M₁)                │
-│           (Fine-grained: 20+ Traffic Categories)            │
-└─────────────────────────────────────────────────────────────┘
-                            ↓ One-shot Distillation
-┌─────────────────────────────────────────────────────────────┐
-│                   Surrogate Model (M̂₁)                      │
-│            (Approximates M₁ with Limited Queries)           │
-└─────────────────────────────────────────────────────────────┘
-                            ↓ Elasticity-Guided Search
-┌─────────────────────────────────────────────────────────────┐
-│              Perturbation Set Discovery (U★)                │
-│      Layer I: Submodular Coverage (Prototypes)              │
-│      Layer II: Genetic Evolution (Refinement)               │
-└─────────────────────────────────────────────────────────────┘
-```
-
 ## Installation
 
 ### Requirements
@@ -237,7 +210,7 @@ evolution:
 | USTC-TFC2016 | -5.2% | -12.8% | -18.4% | -20.6% |
 | CIC-Darknet2020 | -6.1% | -14.3% | -19.7% | -22.2% |
 | CESNET-TLS22 | -5.8% | -13.9% | -20.1% | -22.3% |
-| Private C2 | -7.3% | -16.2% | -22.8% | -24.8% |
+| Private datasets | -7.3% | -16.2% | -22.8% | -24.8% |
 
 ### Effect of Pretraining Scale
 
@@ -250,13 +223,3 @@ Larger pretraining corpora consistently amplify rebound strength:
 Rebound increases monotonically with model size:
 - 8B parameters: KL ↓ 0.106 → 0.083 (-21.7%)
 - 70B parameters: KL ↓ 0.106 → 0.059 (-44.3%)
-
-## Citation
-
-
-
-## License
-
-
-
-## Acknowledgments
