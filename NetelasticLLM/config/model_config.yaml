@@ -1,0 +1,106 @@
+# Model Configuration for Elasticity-Guided Traffic LLM
+
+# Pretrained Backbone Models
+backbone:
+  # Available architectures: llama, qwen, deepseek, mixtral
+  architecture: "llama"
+  
+  # Model sizes (parameters in billions)
+  model_sizes:
+    small: 8
+    medium: 70
+    large: 405
+  
+  # Selected model configuration
+  selected_size: "small"
+  
+  # Transformer specifications
+  transformer:
+    num_layers: 32
+    hidden_size: 4096
+    num_attention_heads: 32
+    intermediate_size: 11008
+    max_position_embeddings: 4096
+    vocab_size: 32000
+    
+  # Pretraining corpus sizes (in tokens)
+  pretraining_scales:
+    - 0.07T  # 70 billion tokens
+    - 0.16T  # 160 billion tokens
+    - 0.32T  # 320 billion tokens
+    - 0.56T  # 560 billion tokens
+
+# Traffic Classification Model
+traffic_classifier:
+  # Input representation
+  input_type: "packet_sequence"  # Options: packet_sequence, flow_statistics, byte_level
+  max_sequence_length: 256
+  
+  # Feature dimensions
+  packet_features:
+    direction_dim: 2  # +1, -1
+    length_dim: 1
+    timing_dim: 1
+    
+  # Classification head
+  num_coarse_classes: 2  # benign vs malicious
+  num_fine_classes: 20  # specific malware families or services
+  
+  # Embedding configuration
+  embedding:
+    direction_embed_dim: 64
+    length_embed_dim: 128
+    timing_embed_dim: 128
+    combined_dim: 320
+
+# Fine-tuning Strategies
+fine_tuning:
+  methods:
+    # Full parameter fine-tuning
+    full_ft:
+      update_all_parameters: true
+      learning_rate: 2.0e-5
+      
+    # Low-rank adaptation (LoRA)
+    lora:
+      rank: 8
+      alpha: 32
+      target_modules: ["q_proj", "v_proj", "k_proj", "o_proj"]
+      dropout: 0.1
+      
+    # Prefix tuning
+    prefix:
+      prefix_length: 128
+      projection_depth: 2
+      prefix_dropout: 0.1
+      
+  # Alignment dataset sizes
+  alignment_sizes:
+    - 1000
+    - 5000
+    - 10000
+    
+  # Training parameters
+  batch_size: 32
+  gradient_accumulation_steps: 4
+  max_epochs: 50
+  warmup_steps: 500
+  weight_decay: 5.0e-4
+
+# Surrogate Model Configuration
+surrogate:
+  architecture: "lightweight_transformer"
+  num_layers: 6
+  hidden_size: 512
+  num_attention_heads: 8
+  
+  # Distillation parameters
+  distillation:
+    temperature: 2.0
+    alpha: 0.5  # weight for distillation loss
+    
+  # One-shot query budget
+  query_budget:
+    warmup_samples: 1000
+    active_refinement_samples: 500
+    total_budget: 1500
