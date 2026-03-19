@@ -1,274 +1,273 @@
 """
-Flow Parser for Network Traffic Analysis
+data/preprocessing/flow_parser.py
+Converts raw PCAP files into bidirectional flow records.
 
-This module provides utilities for parsing PCAP files and extracting
-flow-level representations suitable for LLM-based traffic analysis.
+Each flow is a sequence of (direction, length, inter-arrival) triplets,
+per Definition 1 in the paper:
+    x = {(d_i, l_i, δ_i)}_{i=1}^{N}
+where
+    d_i ∈ {+1, -1}  — packet direction (+1 = client→server)
+    l_i              — packet length in bytes
+    δ_i = t_i - t_{i-1} — inter-arrival interval (δ_1 = 0)
+
+Requires: scapy  (pip install scapy)
+Falls back to a mock implementation when scapy is unavailable.
 """
 
-import numpy as np
-from typing import Dict, List, Tuple, Optional
-from collections import defaultdict
-from dataclasses import dataclass
+from __future__ import annotations
+
+import os
 import logging
+import hashlib
+from dataclasses import dataclass, field
+from typing import Dict, List, Tuple, Optional
+
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
+# Try to import scapy; fall back gracefully
+try:
+    from scapy.all import PcapReader, IP, TCP, UDP         # type: ignore
+    SCAPY_AVAILABLE = True
+except ImportError:
+    SCAPY_AVAILABLE = False
+    logger.warning("scapy not found — PCAP parsing disabled. "
+                   "Install with: pip install scapy")
+
+
+# --------------------------------------------------------------------------- #
+#  Data structures                                                              #
+# --------------------------------------------------------------------------- #
 
 @dataclass
 class Packet:
-    """Represents a single network packet."""
+    """A single observed packet."""
     timestamp: float
-    direction: int  # +1 for client->server, -1 for server->client
-    length: int     # packet size in bytes
-    payload_length: int  # payload size in bytes
-    tcp_flags: Optional[Dict[str, bool]] = None
-    
+    src_ip: str
+    dst_ip: str
+    src_port: int
+    dst_port: int
+    protocol: int          # 6=TCP, 17=UDP
+    length: int            # total packet length (bytes)
+
 
 @dataclass
 class Flow:
-    """Represents a bidirectional network flow."""
-    five_tuple: Tuple[str, int, str, int, str]  # (src_ip, src_port, dst_ip, dst_port, protocol)
-    packets: List[Packet]
-    start_time: float
-    end_time: float
-    
-    def get_direction_sequence(self) -> List[int]:
-        """Extract packet direction sequence."""
-        return [p.direction for p in self.packets]
-    
-    def get_length_sequence(self) -> List[int]:
-        """Extract packet length sequence."""
-        return [p.length for p in self.packets]
-    
-    def get_timing_sequence(self) -> List[float]:
-        """
-        Extract inter-arrival time sequence.
-        
-        Returns:
-            List of inter-arrival times in milliseconds.
-            First element is 0 by convention (δ₁ = 0).
-        """
-        if not self.packets:
-            return []
-        
-        timings = [0.0]  # δ₁ = 0
-        for i in range(1, len(self.packets)):
-            delta = (self.packets[i].timestamp - self.packets[i-1].timestamp) * 1000  # convert to ms
-            timings.append(max(0.0, delta))  # ensure non-negative
-        
-        return timings
-    
-    def to_dict(self) -> Dict:
-        """Convert flow to dictionary representation."""
-        return {
-            "direction": self.get_direction_sequence(),
-            "length": self.get_length_sequence(),
-            "timing": self.get_timing_sequence(),
-            "duration": (self.end_time - self.start_time) * 1000,  # in ms
-            "num_packets": len(self.packets),
-            "total_bytes": sum(p.length for p in self.packets)
-        }
+    """
+    Bidirectional network flow derived from a 5-tuple key.
 
+    Attributes
+    ----------
+    key          : (src_ip, dst_ip, src_port, dst_port, protocol)
+    client_ip    : IP of the flow initiator (first seen src)
+    directions   : List[int] — +1 or -1 per packet
+    lengths      : List[int] — packet lengths
+    timestamps   : List[float]
+    deltas       : List[float] — inter-arrival intervals (δ_1 = 0)
+    """
+    key: Tuple
+    client_ip: str = ""
+    directions: List[int]  = field(default_factory=list)
+    lengths: List[int]     = field(default_factory=list)
+    timestamps: List[float]= field(default_factory=list)
+    deltas: List[float]    = field(default_factory=list)
+
+    def to_array(self) -> np.ndarray:
+        """Return (N, 3) array: columns = [direction, length, delta]."""
+        return np.stack([
+            np.array(self.directions, dtype=np.float32),
+            np.array(self.lengths,    dtype=np.float32),
+            np.array(self.deltas,     dtype=np.float32),
+        ], axis=1)
+
+    @property
+    def num_packets(self) -> int:
+        return len(self.directions)
+
+    def is_valid(
+        self,
+        min_packets: int = 2,
+        min_payload: int = 1,
+    ) -> bool:
+        return (
+            self.num_packets >= min_packets and
+            sum(self.lengths) >= min_payload
+        )
+
+
+# --------------------------------------------------------------------------- #
+#  PCAP → Flow conversion                                                       #
+# --------------------------------------------------------------------------- #
 
 class FlowParser:
     """
-    Parser for converting PCAP files to flow representations.
-    
-    This parser implements:
-    - 5-tuple flow identification
-    - Bidirectional flow merging
-    - Idle timeout-based flow termination
-    - Direction assignment based on first packet
+    Parses a PCAP file and segments packets into bidirectional flows
+    using a 5-tuple key with an idle-timeout policy.
+
+    Parameters
+    ----------
+    idle_timeout   : Seconds of inactivity before a new flow is started.
+    min_packets    : Minimum packets for a valid flow.
+    max_packets    : Truncate flows longer than this.
     """
-    
+
     def __init__(
         self,
         idle_timeout: float = 60.0,
         min_packets: int = 2,
-        min_payload_bytes: int = 1
+        max_packets: int = 200,
     ):
-        """
-        Initialize flow parser.
-        
-        Args:
-            idle_timeout: Flow idle timeout in seconds
-            min_packets: Minimum packets for valid flow
-            min_payload_bytes: Minimum payload bytes for valid flow
-        """
         self.idle_timeout = idle_timeout
-        self.min_packets = min_packets
-        self.min_payload_bytes = min_payload_bytes
-        
-        # Flow tracking
-        self.active_flows: Dict[Tuple, Flow] = {}
-        self.completed_flows: List[Flow] = []
-    
+        self.min_packets  = min_packets
+        self.max_packets  = max_packets
+
+    # ------------------------------------------------------------------ #
+
     def parse_pcap(self, pcap_path: str) -> List[Flow]:
         """
-        Parse a PCAP file and extract flows.
-        
-        Args:
-            pcap_path: Path to PCAP file
-            
-        Returns:
-            List of Flow objects
+        Parse a single PCAP file and return a list of valid flows.
+
+        Falls back to an empty list with a warning when scapy is absent.
         """
-        try:
-            from scapy.all import rdpcap, IP, TCP, UDP
-        except ImportError:
-            logger.error("scapy not installed. Install with: pip install scapy")
-            raise
-        
-        logger.info(f"Parsing PCAP file: {pcap_path}")
-        packets = rdpcap(pcap_path)
-        
-        for pkt in packets:
-            self._process_packet(pkt)
-        
-        # Finalize all active flows
-        self._finalize_all_flows()
-        
-        # Filter flows
-        valid_flows = self._filter_flows()
-        
-        logger.info(f"Extracted {len(valid_flows)} valid flows from {len(packets)} packets")
-        return valid_flows
-    
-    def _process_packet(self, pkt) -> None:
-        """
-        Process a single packet and update flow state.
-        
-        Args:
-            pkt: Scapy packet object
-        """
-        from scapy.all import IP, TCP, UDP
-        
-        if not pkt.haslayer(IP):
-            return
-        
-        ip_layer = pkt[IP]
-        
-        # Determine transport protocol
-        if pkt.haslayer(TCP):
-            transport = pkt[TCP]
-            protocol = "TCP"
-        elif pkt.haslayer(UDP):
-            transport = pkt[UDP]
-            protocol = "UDP"
-        else:
-            return
-        
-        # Extract 5-tuple
-        src_ip = ip_layer.src
-        dst_ip = ip_layer.dst
-        src_port = transport.sport
-        dst_port = transport.dport
-        
-        # Create forward and reverse tuples
-        forward_tuple = (src_ip, src_port, dst_ip, dst_port, protocol)
-        reverse_tuple = (dst_ip, dst_port, src_ip, src_port, protocol)
-        
-        # Determine if this belongs to an existing flow
-        timestamp = float(pkt.time)
-        
-        if forward_tuple in self.active_flows:
-            flow = self.active_flows[forward_tuple]
-            direction = 1  # client->server
-        elif reverse_tuple in self.active_flows:
-            flow = self.active_flows[reverse_tuple]
-            direction = -1  # server->client
-        else:
-            # New flow - first packet determines direction
-            flow = Flow(
-                five_tuple=forward_tuple,
-                packets=[],
-                start_time=timestamp,
-                end_time=timestamp
-            )
-            self.active_flows[forward_tuple] = flow
-            direction = 1
-        
-        # Check idle timeout
-        if timestamp - flow.end_time > self.idle_timeout:
-            self._finalize_flow(forward_tuple if direction == 1 else reverse_tuple)
-            # Start new flow
-            flow = Flow(
-                five_tuple=forward_tuple if direction == 1 else reverse_tuple,
-                packets=[],
-                start_time=timestamp,
-                end_time=timestamp
-            )
-            self.active_flows[forward_tuple if direction == 1 else reverse_tuple] = flow
-        
-        # Add packet to flow
-        packet = Packet(
-            timestamp=timestamp,
-            direction=direction,
-            length=len(pkt),
-            payload_length=len(pkt.payload) if hasattr(pkt, 'payload') else 0,
-            tcp_flags=self._extract_tcp_flags(pkt) if pkt.haslayer(TCP) else None
+        if not SCAPY_AVAILABLE:
+            logger.error("scapy required for PCAP parsing.")
+            return []
+
+        if not os.path.isfile(pcap_path):
+            raise FileNotFoundError(f"PCAP not found: {pcap_path}")
+
+        active: Dict[str, Flow] = {}      # flow_key → current Flow
+        last_seen: Dict[str, float] = {}  # flow_key → last packet time
+        completed: List[Flow] = []
+
+        with PcapReader(pcap_path) as reader:
+            for pkt in reader:
+                parsed = self._extract_packet(pkt)
+                if parsed is None:
+                    continue
+
+                # Canonical 5-tuple (sorted for bidirectional grouping)
+                fwd_key = (
+                    parsed.src_ip, parsed.dst_ip,
+                    parsed.src_port, parsed.dst_port,
+                    parsed.protocol,
+                )
+                rev_key = (
+                    parsed.dst_ip, parsed.src_ip,
+                    parsed.dst_port, parsed.src_port,
+                    parsed.protocol,
+                )
+
+                # Prefer existing direction; otherwise create new
+                if fwd_key in active:
+                    flow_key = fwd_key
+                    direction = +1
+                elif rev_key in active:
+                    flow_key = rev_key
+                    direction = -1
+                else:
+                    # New flow
+                    flow_key = fwd_key
+                    direction = +1
+
+                # Idle timeout check
+                if flow_key in last_seen:
+                    gap = parsed.timestamp - last_seen[flow_key]
+                    if gap > self.idle_timeout:
+                        completed.append(active.pop(flow_key))
+                        last_seen.pop(flow_key)
+
+                if flow_key not in active:
+                    flow = Flow(key=flow_key, client_ip=parsed.src_ip)
+                    active[flow_key] = flow
+
+                flow = active[flow_key]
+                if flow.num_packets < self.max_packets:
+                    delta = (
+                        parsed.timestamp - flow.timestamps[-1]
+                        if flow.timestamps else 0.0
+                    )
+                    flow.directions.append(direction)
+                    flow.lengths.append(parsed.length)
+                    flow.timestamps.append(parsed.timestamp)
+                    flow.deltas.append(delta)
+                    last_seen[flow_key] = parsed.timestamp
+
+        # Flush remaining active flows
+        completed.extend(active.values())
+
+        valid = [f for f in completed if f.is_valid(self.min_packets)]
+        logger.info(
+            "Parsed %s: %d total flows, %d valid.",
+            pcap_path, len(completed), len(valid),
         )
-        
-        flow.packets.append(packet)
-        flow.end_time = timestamp
-    
-    def _extract_tcp_flags(self, pkt) -> Dict[str, bool]:
-        """Extract TCP flags from packet."""
-        from scapy.all import TCP
-        
-        tcp = pkt[TCP]
-        return {
-            "FIN": bool(tcp.flags & 0x01),
-            "SYN": bool(tcp.flags & 0x02),
-            "RST": bool(tcp.flags & 0x04),
-            "PSH": bool(tcp.flags & 0x08),
-            "ACK": bool(tcp.flags & 0x10),
-            "URG": bool(tcp.flags & 0x20)
-        }
-    
-    def _finalize_flow(self, flow_tuple: Tuple) -> None:
-        """Move flow from active to completed."""
-        if flow_tuple in self.active_flows:
-            flow = self.active_flows.pop(flow_tuple)
-            self.completed_flows.append(flow)
-    
-    def _finalize_all_flows(self) -> None:
-        """Finalize all active flows."""
-        for flow_tuple in list(self.active_flows.keys()):
-            self._finalize_flow(flow_tuple)
-    
-    def _filter_flows(self) -> List[Flow]:
-        """
-        Filter flows based on validity constraints.
-        
-        Returns:
-            List of valid flows
-        """
-        valid_flows = []
-        
-        for flow in self.completed_flows:
-            # Check minimum packets
-            if len(flow.packets) < self.min_packets:
-                continue
-            
-            # Check minimum payload bytes
-            total_payload = sum(p.payload_length for p in flow.packets)
-            if total_payload < self.min_payload_bytes:
-                continue
-            
-            valid_flows.append(flow)
-        
-        return valid_flows
-    
+        return valid
+
+    def parse_directory(self, directory: str, label: int) -> List[Tuple[Flow, int]]:
+        """Parse all PCAP files in a directory, returning (flow, label) pairs."""
+        result = []
+        for fname in sorted(os.listdir(directory)):
+            if fname.endswith((".pcap", ".pcapng")):
+                fpath = os.path.join(directory, fname)
+                flows = self.parse_pcap(fpath)
+                result.extend((f, label) for f in flows)
+        return result
+
+    # ------------------------------------------------------------------ #
+    #  Internal helpers                                                     #
+    # ------------------------------------------------------------------ #
+
     @staticmethod
-    def flows_to_dataset_format(flows: List[Flow]) -> List[Dict]:
-        """
-        Convert flows to dataset-compatible format.
-        
-        Args:
-            flows: List of Flow objects
-            
-        Returns:
-            List of flow dictionaries
-        """
-        return [flow.to_dict() for flow in flows]
+    def _extract_packet(pkt) -> Optional[Packet]:
+        """Extract relevant fields from a scapy packet object."""
+        if not (pkt.haslayer(IP) and (pkt.haslayer(TCP) or pkt.haslayer(UDP))):
+            return None
+        try:
+            ip    = pkt[IP]
+            layer = pkt[TCP] if pkt.haslayer(TCP) else pkt[UDP]
+            return Packet(
+                timestamp = float(pkt.time),
+                src_ip    = ip.src,
+                dst_ip    = ip.dst,
+                src_port  = int(layer.sport),
+                dst_port  = int(layer.dport),
+                protocol  = 6 if pkt.haslayer(TCP) else 17,
+                length    = len(pkt),
+            )
+        except Exception:
+            return None
+
+
+# --------------------------------------------------------------------------- #
+#  Mock flow generator (for testing without PCAP files)                        #
+# --------------------------------------------------------------------------- #
+
+def generate_mock_flows(
+    n_flows: int = 100,
+    min_pkts: int = 5,
+    max_pkts: int = 50,
+    seed: int = 0,
+) -> List[Flow]:
+    """
+    Generate synthetic Flow objects for unit tests and smoke runs.
+    """
+    rng = np.random.default_rng(seed)
+    flows = []
+    for i in range(n_flows):
+        n = int(rng.integers(min_pkts, max_pkts + 1))
+        directions  = rng.choice([1, -1], size=n).tolist()
+        lengths     = rng.integers(40, 1461, size=n).tolist()
+        timestamps  = np.cumsum(rng.exponential(0.1, size=n)).tolist()
+        deltas      = [0.0] + [timestamps[j] - timestamps[j-1]
+                               for j in range(1, n)]
+        flow = Flow(
+            key         = ("10.0.0.1", "10.0.0.2", 1234, 80, 6),
+            client_ip   = "10.0.0.1",
+            directions  = directions,
+            lengths     = lengths,
+            timestamps  = timestamps,
+            deltas      = deltas,
+        )
+        flows.append(flow)
+    return flows

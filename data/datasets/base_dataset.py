@@ -1,15 +1,15 @@
 """
-Base Dataset Class for Encrypted Traffic Analysis
-
-This module provides the abstract base class for all traffic datasets,
-defining the common interface and preprocessing pipelines.
+data/datasets/base_dataset.py
+Abstract base class for all traffic datasets.
 """
 
+import os
 import numpy as np
 import torch
 from torch.utils.data import Dataset
-from typing import Dict, List, Tuple, Optional
 from abc import ABC, abstractmethod
+from typing import Dict, List, Tuple, Optional
+import pickle
 import logging
 
 logger = logging.getLogger(__name__)
@@ -18,186 +18,200 @@ logger = logging.getLogger(__name__)
 class BaseTrafficDataset(Dataset, ABC):
     """
     Abstract base class for encrypted traffic datasets.
-    
-    All traffic datasets should inherit from this class and implement
-    the required abstract methods.
+
+    Each sample is a network flow represented as:
+        x : feature vector (numpy array of shape [feature_dim])
+        y_fine : fine-grained label (int)
+        y_coarse : coarse label — 0=benign, 1=malicious (int)
+
+    Subclasses must implement:
+        - load_raw_data()
+        - get_label_names()
+        - get_coarse_label(fine_label) -> int
     """
-    
+
+    # ------------------------------------------------------------------
+    # Mandatory interface
+    # ------------------------------------------------------------------
+
+    @abstractmethod
+    def load_raw_data(self) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Returns:
+            features : np.ndarray of shape (N, feature_dim)
+            labels   : np.ndarray of shape (N,) — fine-grained integer labels
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_label_names(self) -> List[str]:
+        """Returns list of fine-grained class names ordered by label index."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_coarse_label(self, fine_label: int) -> int:
+        """Map fine-grained label to coarse binary label (0=benign,1=malicious)."""
+        raise NotImplementedError
+
+    # ------------------------------------------------------------------
+    # Common implementation
+    # ------------------------------------------------------------------
+
     def __init__(
         self,
-        data_path: str,
+        root_dir: str,
         split: str = "train",
-        max_sequence_length: int = 256,
-        min_packets: int = 2,
-        min_payload_bytes: int = 1,
-        preprocess: bool = True
+        pretrain_ratio: float = 0.75,
+        finetune_ratio: float = 0.20,
+        test_ratio: float = 0.05,
+        feature_dim: int = 83,
+        normalize: bool = True,
+        cache: bool = True,
+        random_seed: int = 42,
     ):
         """
-        Initialize base dataset.
-        
         Args:
-            data_path: Path to the dataset
-            split: Data split (train, val, or test)
-            max_sequence_length: Maximum number of packets per flow
-            min_packets: Minimum packets required for valid flow
-            min_payload_bytes: Minimum payload bytes for valid flow
-            preprocess: Whether to apply preprocessing
+            root_dir      : Path to dataset root directory.
+            split         : One of 'pretrain', 'finetune', 'test'.
+            pretrain_ratio: Fraction of data for pretraining.
+            finetune_ratio: Fraction of data for fine-tuning.
+            test_ratio    : Fraction of data for testing.
+            feature_dim   : Expected feature vector dimensionality.
+            normalize     : Whether to z-score normalise features.
+            cache         : Cache processed data to disk.
+            random_seed   : RNG seed for reproducible splitting.
         """
-        self.data_path = data_path
+        assert split in ("pretrain", "finetune", "test"), \
+            f"split must be one of pretrain/finetune/test, got {split}"
+        assert abs(pretrain_ratio + finetune_ratio + test_ratio - 1.0) < 1e-6, \
+            "Split ratios must sum to 1."
+
+        self.root_dir = root_dir
         self.split = split
-        self.max_sequence_length = max_sequence_length
-        self.min_packets = min_packets
-        self.min_payload_bytes = min_payload_bytes
-        
-        # Data containers
-        self.flows = []
-        self.labels = []
-        self.coarse_labels = []
-        self.fine_labels = []
-        
-        # Label mappings
-        self.coarse_label_map = {"benign": 0, "malicious": 1}
-        self.fine_label_map = {}
-        
-        # Load and preprocess data
-        self._load_data()
-        if preprocess:
-            self._preprocess()
-            
-        logger.info(f"Loaded {len(self)} samples for {split} split")
-    
-    @abstractmethod
-    def _load_data(self):
-        """
-        Load raw data from disk.
-        Must be implemented by subclasses.
-        """
-        pass
-    
-    def _preprocess(self):
-        """
-        Apply preprocessing to loaded data.
-        """
-        logger.info("Preprocessing flows...")
-        
-        valid_indices = []
-        for idx, flow in enumerate(self.flows):
-            if self._is_valid_flow(flow):
-                valid_indices.append(idx)
-        
-        # Filter invalid flows
-        self.flows = [self.flows[i] for i in valid_indices]
-        self.labels = [self.labels[i] for i in valid_indices]
-        self.coarse_labels = [self.coarse_labels[i] for i in valid_indices]
-        self.fine_labels = [self.fine_labels[i] for i in valid_indices]
-        
-        logger.info(f"Retained {len(valid_indices)}/{len(self.flows) + len(valid_indices)} valid flows")
-    
-    def _is_valid_flow(self, flow: Dict) -> bool:
-        """
-        Check if a flow satisfies validity constraints.
-        
-        Args:
-            flow: Flow dictionary with keys (direction, length, timing)
-            
-        Returns:
-            True if flow is valid, False otherwise
-        """
-        num_packets = len(flow["direction"])
-        total_bytes = sum(flow["length"])
-        
-        return (
-            num_packets >= self.min_packets and
-            total_bytes >= self.min_payload_bytes
+        self.pretrain_ratio = pretrain_ratio
+        self.finetune_ratio = finetune_ratio
+        self.test_ratio = test_ratio
+        self.feature_dim = feature_dim
+        self.normalize = normalize
+        self.cache = cache
+        self.random_seed = random_seed
+
+        self.label_names = self.get_label_names()
+        self.num_classes = len(self.label_names)
+
+        # Load / restore from cache
+        cache_path = os.path.join(root_dir, f"_cache_{split}.pkl")
+        if cache and os.path.exists(cache_path):
+            logger.info(f"Loading cached {split} split from {cache_path}")
+            with open(cache_path, "rb") as f:
+                data = pickle.load(f)
+            self.features = data["features"]
+            self.fine_labels = data["fine_labels"]
+            self.coarse_labels = data["coarse_labels"]
+            self.mean = data.get("mean")
+            self.std = data.get("std")
+        else:
+            self._build_dataset()
+            if cache:
+                os.makedirs(root_dir, exist_ok=True)
+                with open(cache_path, "wb") as f:
+                    pickle.dump({
+                        "features": self.features,
+                        "fine_labels": self.fine_labels,
+                        "coarse_labels": self.coarse_labels,
+                        "mean": self.mean,
+                        "std": self.std,
+                    }, f)
+                logger.info(f"Cached {split} split to {cache_path}")
+
+        logger.info(
+            f"{self.__class__.__name__} [{split}] — "
+            f"{len(self)} samples, {self.num_classes} classes"
         )
-    
+
+    def _build_dataset(self):
+        """Load raw data, split, and optionally normalise."""
+        features, fine_labels = self.load_raw_data()
+        coarse_labels = np.array(
+            [self.get_coarse_label(y) for y in fine_labels], dtype=np.int64
+        )
+
+        # Reproducible stratified split
+        rng = np.random.default_rng(self.random_seed)
+        n = len(features)
+        idx = np.arange(n)
+        rng.shuffle(idx)
+
+        n_pretrain = int(n * self.pretrain_ratio)
+        n_finetune = int(n * self.finetune_ratio)
+
+        split_idx = {
+            "pretrain": idx[:n_pretrain],
+            "finetune": idx[n_pretrain: n_pretrain + n_finetune],
+            "test": idx[n_pretrain + n_finetune:],
+        }[self.split]
+
+        self.features = features[split_idx].astype(np.float32)
+        self.fine_labels = fine_labels[split_idx].astype(np.int64)
+        self.coarse_labels = coarse_labels[split_idx]
+
+        # Normalisation (fit on pretrain only; apply to all)
+        self.mean = None
+        self.std = None
+        if self.normalize:
+            if self.split == "pretrain":
+                self.mean = self.features.mean(axis=0)
+                self.std = self.features.std(axis=0) + 1e-8
+            else:
+                # Caller must set mean/std after construction if needed
+                pass
+            if self.mean is not None:
+                self.features = (self.features - self.mean) / self.std
+
+    def apply_normalization(self, mean: np.ndarray, std: np.ndarray):
+        """Apply external normalization statistics (for finetune/test splits)."""
+        self.mean = mean
+        self.std = std
+        self.features = (self.features - mean) / (std + 1e-8)
+
+    # ------------------------------------------------------------------
+    # Dataset interface
+    # ------------------------------------------------------------------
+
     def __len__(self) -> int:
-        """Return dataset size."""
-        return len(self.flows)
-    
+        return len(self.features)
+
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        """
-        Get a single sample.
-        
-        Args:
-            idx: Sample index
-            
-        Returns:
-            Dictionary containing:
-                - direction: Packet direction sequence [N]
-                - length: Packet length sequence [N]
-                - timing: Inter-arrival time sequence [N]
-                - coarse_label: Binary label (benign/malicious)
-                - fine_label: Fine-grained class label
-                - mask: Padding mask [max_seq_len]
-        """
-        flow = self.flows[idx]
-        
-        # Extract sequences
-        direction = np.array(flow["direction"], dtype=np.int64)
-        length = np.array(flow["length"], dtype=np.float32)
-        timing = np.array(flow["timing"], dtype=np.float32)
-        
-        # Truncate or pad to max_sequence_length
-        num_packets = len(direction)
-        if num_packets > self.max_sequence_length:
-            direction = direction[:self.max_sequence_length]
-            length = length[:self.max_sequence_length]
-            timing = timing[:self.max_sequence_length]
-            num_packets = self.max_sequence_length
-        
-        # Create padding mask (1 for valid tokens, 0 for padding)
-        mask = np.zeros(self.max_sequence_length, dtype=np.float32)
-        mask[:num_packets] = 1.0
-        
-        # Pad sequences
-        padded_direction = np.zeros(self.max_sequence_length, dtype=np.int64)
-        padded_length = np.zeros(self.max_sequence_length, dtype=np.float32)
-        padded_timing = np.zeros(self.max_sequence_length, dtype=np.float32)
-        
-        padded_direction[:num_packets] = direction
-        padded_length[:num_packets] = length
-        padded_timing[:num_packets] = timing
-        
         return {
-            "direction": torch.from_numpy(padded_direction),
-            "length": torch.from_numpy(padded_length),
-            "timing": torch.from_numpy(padded_timing),
-            "coarse_label": torch.tensor(self.coarse_labels[idx], dtype=torch.long),
+            "features": torch.tensor(self.features[idx], dtype=torch.float32),
             "fine_label": torch.tensor(self.fine_labels[idx], dtype=torch.long),
-            "mask": torch.from_numpy(mask)
+            "coarse_label": torch.tensor(self.coarse_labels[idx], dtype=torch.long),
         }
-    
-    def get_statistics(self) -> Dict[str, float]:
-        """
-        Compute dataset statistics.
-        
-        Returns:
-            Dictionary of statistics
-        """
-        all_lengths = []
-        all_timings = []
-        num_packets_list = []
-        
-        for flow in self.flows:
-            all_lengths.extend(flow["length"])
-            all_timings.extend(flow["timing"])
-            num_packets_list.append(len(flow["direction"]))
-        
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def get_class_distribution(self) -> Dict[str, int]:
+        """Return per-class sample counts."""
+        dist = {}
+        for i, name in enumerate(self.label_names):
+            dist[name] = int((self.fine_labels == i).sum())
+        return dist
+
+    def get_coarse_distribution(self) -> Dict[str, int]:
         return {
-            "num_samples": len(self),
-            "avg_packets_per_flow": np.mean(num_packets_list),
-            "std_packets_per_flow": np.std(num_packets_list),
-            "avg_packet_length": np.mean(all_lengths),
-            "std_packet_length": np.std(all_lengths),
-            "avg_inter_arrival": np.mean(all_timings),
-            "std_inter_arrival": np.std(all_timings),
-            "coarse_class_distribution": self._get_class_distribution(self.coarse_labels),
-            "fine_class_distribution": self._get_class_distribution(self.fine_labels)
+            "benign": int((self.coarse_labels == 0).sum()),
+            "malicious": int((self.coarse_labels == 1).sum()),
         }
-    
-    def _get_class_distribution(self, labels: List[int]) -> Dict[int, float]:
-        """Compute class distribution."""
-        unique, counts = np.unique(labels, return_counts=True)
-        total = len(labels)
-        return {int(cls): count / total for cls, count in zip(unique, counts)}
+
+    def subset(self, n: int, random_seed: int = 0) -> "BaseTrafficDataset":
+        """Return a shallow copy with at most n samples (for ablation)."""
+        rng = np.random.default_rng(random_seed)
+        idx = rng.choice(len(self), min(n, len(self)), replace=False)
+        obj = object.__new__(self.__class__)
+        obj.__dict__.update(self.__dict__)
+        obj.features = self.features[idx]
+        obj.fine_labels = self.fine_labels[idx]
+        obj.coarse_labels = self.coarse_labels[idx]
+        return obj
